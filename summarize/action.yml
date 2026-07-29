@@ -21,7 +21,47 @@ runs:
         CONTEXT: ${{ inputs.context }}
       run: |
         set -euo pipefail
-        DIFF="$(gh pr diff "${{ inputs.pr }}" --patch --repo "$GITHUB_REPOSITORY" | head -c 12000)"
+        REPO="$GITHUB_REPOSITORY"
+        PR="${{ inputs.pr }}"
+        DIFF="$(gh pr diff "$PR" --patch --repo "$REPO" | head -c 12000)"
+        PRINFO="$(gh pr view "$PR" --repo "$REPO" --json title,body -q '"Title: "+.title+"\n"+(.body // "")' | head -c 2000)"
+        SHA="$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid)"
+
+        # Deep pass ONLY on a failure: pull failed-job error logs and, for the
+        # dependencies that broke, their declared runtime support.
+        EXTRA=""
+        HAS_BREAKS="$(printf '%s' "$CONTEXT" | jq -r '[.[].breaks[]?] | length' 2>/dev/null || echo 0)"
+        FAILED_JOBS="$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=20" --jq '.workflow_runs[].id' 2>/dev/null \
+          | while read -r rid; do gh api "repos/$REPO/actions/runs/$rid/jobs" --jq '.jobs[] | select(.conclusion=="failure") | .id' 2>/dev/null; done | head -5)" || true
+
+        if [ "${HAS_BREAKS:-0}" -gt 0 ] || [ -n "$FAILED_JOBS" ]; then
+          LOGS=""
+          for jid in $FAILED_JOBS; do
+            L="$(gh api "repos/$REPO/actions/jobs/$jid/logs" 2>/dev/null | grep -iE 'error|traceback|exception|not found|fail' | tail -15 || true)"
+            [ -n "$L" ] && LOGS="$LOGS
+        [failed job $jid]
+        $L"
+          done
+          DEPS=""
+          while read -r row; do
+            [ -z "$row" ] && continue
+            name="$(printf '%s' "$row" | jq -r .target)"
+            eco="$(printf '%s' "$row" | jq -r .ecosystem)"
+            case "$eco" in
+              python) rp="$(curl -sS "https://pypi.org/pypi/$name/json" 2>/dev/null | jq -r '.info.requires_python // "unspecified"')"; DEPS="$DEPS
+        $name requires Python: $rp";;
+              js) rp="$(curl -sS "https://registry.npmjs.org/$name/latest" 2>/dev/null | jq -r '.engines.node // "unspecified"')"; DEPS="$DEPS
+        $name engines.node: $rp";;
+            esac
+          done <<< "$(printf '%s' "$CONTEXT" | jq -c '.[] | select(.kind=="dependency" and ((.breaks|length)>0))' 2>/dev/null || true)"
+
+          [ -n "$LOGS" ] && EXTRA="$EXTRA
+
+        Failed job error logs:$(printf '%s' "$LOGS" | head -c 4000)"
+          [ -n "$DEPS" ] && EXTRA="$EXTRA
+
+        Runtime support of the broken dependencies:$DEPS"
+        fi
 
         case "${{ inputs.provider }}" in
           groq) URL=https://api.groq.com/openai/v1/chat/completions; KEY="$GROQ_API_KEY"; MODEL="${MODEL_IN:-llama-3.3-70b-versatile}";;
@@ -30,13 +70,13 @@ runs:
           *) echo "unknown provider ${{ inputs.provider }}"; exit 0;;
         esac
 
-        SYS='You review a pull request for version-support risk. Given a diff and coverage findings (declared ranges, untested gaps, versions that break), decide if the diff endangers a declared or supported version -- e.g. an import or syntax that requires a newer runtime, or a dependency bump. If so, reply with a short warning: one sentence naming the risk (with file:line if visible), one sentence explaining why, one sentence with a concrete fix. If nothing endangers a supported version, reply with an empty string. Plain markdown, no preamble, no headings.'
+        SYS='You review a pull request for version-support risk. Inputs: the PR title/body, coverage findings (per target: declared range, tested versions, untested gaps, versions a probe proved break, versions a probe proved pass), the diff, and -- only when something failed -- error logs from the failed jobs and the runtime support of the broken dependencies. Use the logs to state the actual error, and the dependency runtime support to judge whether a dependency itself drops a version you declare. Decide whether the change endangers a declared or supported version. If nothing does, reply with an empty string. Otherwise reply with EXACTLY these three tags and nothing else: <warning>one or two sentences naming the risk with file:line if visible, and which version it breaks</warning><fix>one concrete fix</fix><explanation>a plain paragraph or two, referring to the specific change and any error log, that walks through the mechanism, which versions are affected and why, and the tradeoffs of the fix</explanation>. Plain prose inside the tags. No markdown headings, no emoji, no preamble.'
 
-        BODY="$(jq -n --arg m "$MODEL" --arg sys "$SYS" --arg ctx "$CONTEXT" --arg diff "$DIFF" \
-          '{model:$m, temperature:0.2, max_tokens:220, messages:[{role:"system",content:$sys},{role:"user",content:("Coverage findings:\n"+$ctx+"\n\nDiff:\n"+$diff)}]}')"
+        BODY="$(jq -n --arg m "$MODEL" --arg sys "$SYS" --arg pr "$PRINFO" --arg ctx "$CONTEXT" --arg extra "$EXTRA" --arg diff "$DIFF" \
+          '{model:$m, temperature:0.2, max_tokens:600, messages:[{role:"system",content:$sys},{role:"user",content:("PR:\n"+$pr+"\n\nCoverage findings:\n"+$ctx+$extra+"\n\nDiff:\n"+$diff)}]}')"
 
         RESP="$(curl -sS "$URL" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d "$BODY")"
-        TEXT="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // ""' | head -c 1500)"
+        TEXT="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // ""' | head -c 4000)"
         printf '%s' "${TEXT:--}" > "$RUNNER_TEMP/strata-summary.txt"
 
     - uses: actions/upload-artifact@v4
