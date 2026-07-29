@@ -1,5 +1,5 @@
 name: Strata Summary
-description: Post an AI version-support callout for a pull request.
+description: Produce an AI version-support callout as an artifact (nothing posted to the PR).
 
 inputs:
   pr:
@@ -37,6 +37,10 @@ runs:
 
         RESP="$(curl -sS "$URL" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d "$BODY")"
         TEXT="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // ""' | head -c 1500)"
+        printf '%s' "${TEXT:--}" > "$RUNNER_TEMP/strata-summary.txt"
 
-        gh pr comment "${{ inputs.pr }}" --repo "$GITHUB_REPOSITORY" \
-          --body "$(printf '%s\n%s' '<!-- strata:summary -->' "$TEXT")"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: strata-summary
+        path: ${{ runner.temp }}/strata-summary.txt
+        retention-days: 1
