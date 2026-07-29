@@ -1,0 +1,42 @@
+name: Strata Summary
+description: Post an AI version-support callout for a pull request.
+
+inputs:
+  pr:
+    required: true
+  context:
+    required: true
+  provider:
+    required: true
+  model:
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MODEL_IN: ${{ inputs.model }}
+        CONTEXT: ${{ inputs.context }}
+      run: |
+        set -euo pipefail
+        DIFF="$(gh pr diff "${{ inputs.pr }}" --patch --repo "$GITHUB_REPOSITORY" | head -c 12000)"
+
+        case "${{ inputs.provider }}" in
+          groq) URL=https://api.groq.com/openai/v1/chat/completions; KEY="$GROQ_API_KEY"; MODEL="${MODEL_IN:-llama-3.3-70b-versatile}";;
+          openrouter) URL=https://openrouter.ai/api/v1/chat/completions; KEY="$OPENROUTER_API_KEY"; MODEL="${MODEL_IN:-meta-llama/llama-3.3-70b-instruct}";;
+          github-models) URL=https://models.github.ai/inference/chat/completions; KEY="$GITHUB_TOKEN"; MODEL="${MODEL_IN:-meta/Llama-3.3-70B-Instruct}";;
+          *) echo "unknown provider ${{ inputs.provider }}"; exit 0;;
+        esac
+
+        SYS='You review a pull request for version-support risk. Given a diff and coverage findings (declared ranges, untested gaps, versions that break), decide if the diff endangers a declared or supported version -- e.g. an import or syntax that requires a newer runtime, or a dependency bump. If so, reply with a short warning: one sentence naming the risk (with file:line if visible), one sentence explaining why, one sentence with a concrete fix. If nothing endangers a supported version, reply with an empty string. Plain markdown, no preamble, no headings.'
+
+        BODY="$(jq -n --arg m "$MODEL" --arg sys "$SYS" --arg ctx "$CONTEXT" --arg diff "$DIFF" \
+          '{model:$m, temperature:0.2, max_tokens:220, messages:[{role:"system",content:$sys},{role:"user",content:("Coverage findings:\n"+$ctx+"\n\nDiff:\n"+$diff)}]}')"
+
+        RESP="$(curl -sS "$URL" -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d "$BODY")"
+        TEXT="$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // ""' | head -c 1500)"
+
+        gh pr comment "${{ inputs.pr }}" --repo "$GITHUB_REPOSITORY" \
+          --body "$(printf '%s\n%s' '<!-- strata:summary -->' "$TEXT")"
